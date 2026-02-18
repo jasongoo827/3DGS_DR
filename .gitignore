@@ -2,3 +2,4 @@ data/
 *.pyc
 build/
 __pycache__/
+*.egg-info

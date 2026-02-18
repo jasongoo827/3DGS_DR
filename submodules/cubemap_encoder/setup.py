@@ -19,9 +19,9 @@ c_flags = ['-O3', '-std=c++17']
 
 setup(
     ## package name
-    name="cubemapencoder",
+    name="cubemap_encoder",
     ## 포함할 package 목록
-    packages=["cubemapencoder"],
+    packages=["cubemap_encoder"],
     ## extension module 정의 - compiile 대상 지정
     ext_modules=[
         CUDAExtension(

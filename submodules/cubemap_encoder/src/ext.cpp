@@ -1,5 +1,5 @@
 #include <torch/extension.h>
-#include <cubemapencoder.h>
+#include "cubemapencoder.h"
 
 // TORCH_EXTENSION_NAME: setup.py의 name 인자 또는
 // Extension 객체 생성 시 지정한 name을 그대로 가져옴.

@@ -49,24 +49,27 @@ class GaussianModel:
         self.reflection_inverse_activation = inverse_sigmoid
 
 
-    def __init__(self, sh_degree, optimizer_type="default"):
+    def __init__(self, sh_degree = -1):
         self.active_sh_degree = 0
-        self.optimizer_type = optimizer_type
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
-        self._features_dc = torch.empty(0)
-        self._features_rest = torch.empty(0)
+        # self._init_xyz = torch.empty(0) -> init_xyz가 뭐임?
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
-
         self._opacity = torch.empty(0)
         self._reflection_strength = torch.empty(0)
+        self._features_dc = torch.empty(0)
+        self._features_rest = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
         self.optimizer = None
+        # self.free_radius = 0 -> free_radius?
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        self.init_refl_value = 1e-3
+
+        self.env_map = None
         self.setup_functions()
 
     def capture(self):
@@ -124,12 +127,16 @@ class GaussianModel:
         return torch.cat((features_dc, features_rest), dim=1)
     
     @property
-    def get_features_dc(self):
-        return self._features_dc
+    def get_envmap(self):
+        return self.env_map
+
+    # @property
+    # def get_features_dc(self):
+    #     return self._features_dc
     
-    @property
-    def get_features_rest(self):
-        return self._features_rest
+    # @property
+    # def get_features_rest(self):
+    #     return self._features_rest
     
     @property
     def get_opacity(self):
@@ -180,8 +187,11 @@ class GaussianModel:
 
     def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
+
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+
+
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0 ] = fused_color
         features[:, 3:, 1:] = 0.0

@@ -68,6 +68,7 @@ __device__ void EdgeTable(int L, int flag, int* index_xy)
 	}
 }
 
+template<typename scalar_t>
 __device__ void Compute_Cubemap_UV(scalar_t vx, scalar_t vy, scalar_t vz, scalar_t* uv, int* index)
 {
     int max_dim = 0;
@@ -315,7 +316,24 @@ void cubemap_encode_forward(const at::Tensor inputs, const at::Tensor cubemap, c
     uint32_t blocks = uint32_t((B + threads - 1) / threads);
 
     // compute cubemap bilinear seamless kernel
-    Cubemap_Bilinear_Seamless_Kernel<scalar_t><<<blocks, threads>>>();
+    // Cubemap_Bilinear_Seamless_Kernel<scalar_t><<<blocks, threads>>>(
+	// 				inputs.data_ptr<scalar_t>(),
+	// 				cubemap.data_ptr<scalar_t>(),
+	// 				fail_value.data_ptr<scalar_t>(),
+	// 				outputs.data_ptr<scalar_t>(),
+	// 				B, C, L
+	// 			);
+	// 이 매크로 필요함. 본래 코드의 매크로는 무시할 것.
+	AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+    cubemap.scalar_type(), "cubemap_encode_forward", ([&] {
+				Cubemap_Bilinear_Seamless_Kernel<scalar_t><<<blocks, threads>>>(
+					inputs.data_ptr<scalar_t>(),
+					cubemap.data_ptr<scalar_t>(),
+					fail_value.data_ptr<scalar_t>(),
+					outputs.data_ptr<scalar_t>(),
+					B, C, L
+				);
+    }));
 }
 
 template<typename scalar_t>
@@ -442,7 +460,7 @@ __global__ void Cubemap_Bilinear_Seamless_Backward_Kernel(
 }
 
 // backward
-void cubemap_encode_backward(const at::Tensor grad_ouputs, const at::Tensor inputs, const at::Tensor cubemap,
+void cubemap_encode_backward(const at::Tensor grad_outputs, const at::Tensor inputs, const at::Tensor cubemap,
                             at::Tensor grad_cubemap, at::Tensor grad_inputs, at::Tensor grad_fail,
                             const uint32_t B, const uint32_t C, const uint32_t L
 )
