@@ -17,6 +17,7 @@ import os
 import json
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
+from cubemap_encoder import CubemapEncoder
 from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
@@ -64,7 +65,7 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
         self.optimizer = None
-        # self.free_radius = 0 -> free_radius?
+        self.free_radius = 0 # 자유 반경? 전체 포인트들 중 가장 멀리 떨어진 이웃 간의 거리
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.init_refl_value = 1e-3
@@ -108,6 +109,11 @@ class GaussianModel:
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
 
+    def set_opacity_lr(self, lr):
+        for param_group in self.optimizer.param_groups:
+            if param_group["name"] == "opacity":
+                param_group['lr'] = lr
+
     @property
     def get_scaling(self):
         return self.scaling_activation(self._scaling)
@@ -150,27 +156,33 @@ class GaussianModel:
     def get_reflection_strength(self):
         return self.reflection_activation(self._reflection_strength)
 
-    def get_normal(self, view_dirs=None):
-        # 1. Get scales and rotations
+    def get_min_axis(self, cam_o):
+        pts = self.get_xyz
+        p2o = cam_o[None] - pts
+
+        # 가장 짧은 축 찾기
         scales = self.get_scaling
-        rots = self.get_rotation
-        
-        # 2. Convert quaternion to rotation matrix
-        R = build_rotation(rots) # (N, 3, 3)
-        
-        # 3. Find index of shortest axis
-        min_scale_indices = torch.argmin(scales, dim=1) # (N,)
-        
-        # 4. Extract corresponding column from R
-        normals = torch.gather(R, 2, min_scale_indices.unsqueeze(1).unsqueeze(2).expand(-1, 3, 1)).squeeze(2)
-        
-        # 5. Flip based on view direction if provided
-        if view_dirs is not None:
-             dots = (normals * view_dirs).sum(dim=1, keepdim=True)
-             mask = (dots > 0).float()
-             normals = normals * (1 - 2 * mask)
-             
-        return normals
+        # argmin
+        ## dim = -1: 어느 축을 기준으로 최솟값을 찾을지 결정.
+        ## keepdim = True: 연산 후에도 차원 수 유지 (False일 때는 (N,) 형태의 1D 벡터)
+        min_axis_id = torch.argmin(scales, dim = -1, keepdim=True)
+        # scatter(dim, id, value)
+        ## dim: 데이터를 뿌릴 축
+        ## id: 값을 넣을 index
+        ## value: 그 위치에 채울 값 
+        min_axis = torch.zeros_like(scales).scatter(1, min_axis_id, 1)
+
+        rot_matrix = build_rotation(self.get_rotation)
+
+        # 가장 짧은 축을 회전
+        # unsqueeze, squeeze: 차원을 늘리고 줄이는 함수
+        # Batch Matrix Multiplication (배치 행렬 곱)
+        ndir = torch.bmm(rot_matrix, min_axis.unsqueeze(-1)).squeeze(-1)
+
+        # 카메라 방향을 기준으로 정렬
+        neg_msk = torch.sum(p2o*ndir, dim=-1) < 0 # 내적
+        ndir[neg_msk] = -ndir[neg_msk] # make sure normal orient to camera
+        return ndir
 
     def get_exposure_from_name(self, image_name):
         if self.pretrained_exposures is None:
@@ -185,39 +197,57 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float):
-        self.spatial_lr_scale = spatial_lr_scale
-
-        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
-        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
-
-
+    def init_properties_from_pcd(self, pts, colors):
+        fused_color = RGB2SH(colors)
+        # [N, 3, max_degree + 1]
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        # 0차 계수
         features[:, :3, 0 ] = fused_color
+        # 1차 이상은 0으로 초기화
         features[:, 3:, 1:] = 0.0
 
-        print("Number of points at initialisation : ", fused_point_cloud.shape[0])
-
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
-        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
-        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        # 가장 가까운 이웃 점까지의 거리 제곱
+        dist2 = torch.clamp_min(distCUDA2(pts), 0.0000001)
+        self.free_radius = torch.sqrt(dist2.max())
+        # x, y, z 축 방향으로 같은 scale을 log로 취함
+        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3) # KNN--Find the distance of the closest point to determine the initial scale (avoid holes)
+        # 단위 quaternion
+        rots = torch.zeros((pts.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 
-        opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        # 초기에 불투명도 0.1로 설정
+        opacities = inverse_sigmoid(0.1 * torch.ones((pts.shape[0], 1), dtype=torch.float, device="cuda"))
+        # 마찬가지로 reflection도
+        refl = self.inverse_refl_activation(torch.ones_like(opacities).cuda() * self.init_refl_value) ##
+        return {
+            'opac': opacities, 'rot':rots, 'scale':scales, 'shs':features, 'refl':refl
+        }
 
-        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
-        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
-        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
-        self._scaling = nn.Parameter(scales.requires_grad_(True))
-        self._rotation = nn.Parameter(rots.requires_grad_(True))
+    def create_from_pcd(self, pcd, spatial_lr_scale: float, cubemap_resol = 128):
+        self.spatial_lr_scale = spatial_lr_scale
 
-        self._opacity = nn.Parameter(opacities.requires_grad_(True))
-        self._reflection_strength = nn.Parameter(torch.zeros((fused_point_cloud.shape[0], 1), device="cuda").requires_grad_(True))
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos)}
-        self.pretrained_exposures = None
-        exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
-        self._exposure = nn.Parameter(exposure.requires_grad_(True))
+        pts = torch.tensor(np.asarray(pcd.points)).float().cuda()
+        colors = torch.tensor(np.asarray(pcd.colors)).float().cuda()
+        base_prop = self.init_properties_from_pcd(pts, colors)
+        base_prop['xyz'] = pts
+        print("Number of base points at initialisation : ", pts.shape[0])
+
+        for key in base_prop.keys():
+            base_prop[key] = base_prop[key].cuda()
+        tot_props = base_prop
+
+        self._xyz = nn.Parameter(tot_props['xyz'].requires_grad_(True))
+        self._scaling = nn.Parameter(tot_props['scale'].requires_grad_(True))
+        self._rotation = nn.Parameter(tot_props['rot'].requires_grad_(True))
+        self._opacity = nn.Parameter(tot_props['opac'].requires_grad_(True))
+        self._reflection_strength = nn.Parameter(tot_props['refl'].requires_grad_(True))
+        self._features_dc = nn.Parameter(tot_props['shs'][:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(tot_props['shs'][:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+        
+        env_map = CubemapEncoder(output_dim=3, resolution=cubemap_resol)
+        self.env_map = env_map.cuda()
+
+        self.max_radii2D = torch.zeros((self._xyz.shape[0]), device="cuda")
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -290,42 +320,109 @@ class GaussianModel:
         normals = np.zeros_like(xyz)
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        reflection_strength = self._reflection_strength.detach().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
-
         rotation = self._rotation.detach().cpu().numpy()
-        reflection_strength = self._reflection_strength.detach().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, reflection_strength), axis=1)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, reflection_strength, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
+
+        if self.env_map is not None:
+            save_path = path.replace('.ply', '.map')
+            torch.save(self.env_map.state_dict(), save_path)
 
     def reset_opacity(self):
         opacities_new = self.inverse_opacity_activation(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
 
-    def load_ply(self, path, use_train_test_exp = False):
+    def reset_opacity0(self):
+        RESET_V = 0.01
+        #REFL_MSK_THR = 0.1
+        #refl_msk = self.get_refl.flatten() > REFL_MSK_THR
+        opacity_old = self.get_opacity
+        o_msk = (opacity_old < RESET_V).flatten()
+        opacities_new = torch.ones_like(opacity_old)*inverse_sigmoid(torch.tensor([RESET_V]).cuda())
+        opacities_new[o_msk] = self._opacity[o_msk]
+        # only reset non-refl gaussians
+        #opacities_new[refl_msk] = self._opacity[refl_msk]
+        optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
+        if "opacity" not in optimizable_tensors: return
+        self._opacity = optimizable_tensors["opacity"]
+
+    def reset_opacity1(self, exclusive_msk = None):
+        RESET_V = 0.9
+        #REFL_MSK_THR = 0.1
+        #refl_msk = self.get_refl.flatten() < REFL_MSK_THR
+        opacity_old = self.get_opacity
+        o_msk = (opacity_old > RESET_V).flatten()
+        if exclusive_msk is not None:
+            o_msk = torch.logical_or(o_msk, exclusive_msk)
+        opacities_new = torch.ones_like(opacity_old)*inverse_sigmoid(torch.tensor([RESET_V]).cuda())
+        opacities_new[o_msk] = self._opacity[o_msk]
+        # only reset refl gaussians
+        #opacities_new[refl_msk] = self._opacity[refl_msk]
+        optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
+        if "opacity" not in optimizable_tensors: return
+        self._opacity = optimizable_tensors["opacity"]
+
+    def reset_refl(self, exclusive_msk = None):
+        refl_new = inverse_sigmoid(torch.max(self.get_reflection_strength, torch.ones_like(self.get_reflection_strength)*self.init_refl_value))
+        if exclusive_msk is not None:
+            refl_new[exclusive_msk] = self._reflection_strength[exclusive_msk]
+        optimizable_tensors = self.replace_tensor_to_optimizer(refl_new, "refl")
+        if "refl" not in optimizable_tensors: return
+        self._reflection_strength = optimizable_tensors["refl"]
+
+    def dist_color(self, exclusive_msk = None):
+        REFL_MSK_THR = 0.05
+        DIST_RANGE = 0.4
+        refl_msk = self.get_reflection_strength.flatten() > REFL_MSK_THR
+        if exclusive_msk is not None:
+            refl_msk = torch.logical_or(refl_msk, exclusive_msk)
+        dcc = self._features_dc.clone()
+        dist_dcc = dcc + (torch.rand_like(dcc)*DIST_RANGE*2-DIST_RANGE) # ~0.4~0.4
+        dist_dcc[refl_msk] = dcc[refl_msk]
+        optimizable_tensors = self.replace_tensor_to_optimizer(dist_dcc, "f_dc")
+        if "f_dc" not in optimizable_tensors: return
+        self._features_dc = optimizable_tensors["f_dc"]
+
+    def enlarge_refl_scales(self, ret_raw = True, ENLARGE_SCALE=1.5, REFL_MSK_THR = 0.02, exclusive_msk = None):
+        refl_msk = self.get_reflection_strength.flatten() < REFL_MSK_THR
+        if exclusive_msk is not None:
+            refl_msk = torch.logical_or(refl_msk, exclusive_msk)
+        scales = self.get_scaling
+        min_axis_id = torch.argmin(scales, dim = -1, keepdim=True)
+        rmin_axis = (torch.ones_like(scales)*ENLARGE_SCALE).scatter(1, min_axis_id, 1)
+        if ret_raw:
+            scale_new = self.scaling_inverse_activation(scales*rmin_axis)
+            # only reset refl gaussians
+            scale_new[refl_msk] = self._scaling[refl_msk]
+        else:
+            scale_new = scales*rmin_axis
+            scale_new[refl_msk] = scales[refl_msk]
+        return scale_new
+
+    def reset_scale(self, exclusive_msk = None):
+        scale_new = self.enlarge_refl_scales(ret_raw=True, exclusive_msk=exclusive_msk)
+        optimizable_tensors = self.replace_tensor_to_optimizer(scale_new, "scaling")
+        if "scaling" not in optimizable_tensors: return
+        self._scaling = optimizable_tensors["scaling"]
+
+    def load_ply(self, path):
         plydata = PlyData.read(path)
-        if use_train_test_exp:
-            exposure_file = os.path.join(os.path.dirname(path), os.pardir, os.pardir, "exposure.json")
-            if os.path.exists(exposure_file):
-                with open(exposure_file, "r") as f:
-                    exposures = json.load(f)
-                self.pretrained_exposures = {image_name: torch.FloatTensor(exposures[image_name]).requires_grad_(False).cuda() for image_name in exposures}
-                print(f"Pretrained exposures loaded.")
-            else:
-                print(f"No exposure to be loaded at {exposure_file}")
-                self.pretrained_exposures = None
 
         xyz = np.stack((np.asarray(plydata.elements[0]["x"]),
                         np.asarray(plydata.elements[0]["y"]),
                         np.asarray(plydata.elements[0]["z"])),  axis=1)
         opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
+        refls = np.asarray(plydata.elements[0]["refl"])[..., np.newaxis]
 
         features_dc = np.zeros((xyz.shape[0], 3, 1))
         features_dc[:, 0, 0] = np.asarray(plydata.elements[0]["f_dc_0"])
@@ -340,6 +437,7 @@ class GaussianModel:
             features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
         # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
         features_extra = features_extra.reshape((features_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1))
+        self.active_sh_degree = self.max_sh_degree
 
         scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
         scale_names = sorted(scale_names, key = lambda x: int(x.split('_')[-1]))
@@ -353,19 +451,21 @@ class GaussianModel:
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
-            
-        try:
-             reflection_strength = np.asarray(plydata.elements[0]["f_reflection"])[..., np.newaxis]
-        except:
-             reflection_strength = np.zeros((xyz.shape[0], 1))
+        #mlp_path = path.replace('.ply', '.ckpt')
+        #if os.path.exists(mlp_path):
+        #    self.mlp.load_state_dict(torch.load(mlp_path))
+        map_path = path.replace('.ply', '.map')
+        if os.path.exists(map_path):
+            self.env_map = CubemapEncoder(output_dim=3, resolution=128).cuda()
+            self.env_map.load_state_dict(torch.load(map_path))
+
+        self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
         self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
+        self._reflection_strength = nn.Parameter(torch.tensor(refls, dtype=torch.float, device="cuda").requires_grad_(True))
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._reflection_strength = nn.Parameter(torch.tensor(reflection_strength, dtype=torch.float, device="cuda").requires_grad_(True))
-
-        self.active_sh_degree = self.max_sh_degree
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
@@ -416,7 +516,6 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
-        self.tmp_radii = self.tmp_radii[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -440,7 +539,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_reflection_strength, new_tmp_radii):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_reflection_strength):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -457,7 +556,6 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
-        self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
@@ -482,9 +580,8 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_reflection_strength = self._reflection_strength[selected_pts_mask].repeat(N,1)
-        new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
         
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_reflection_strength, new_tmp_radii)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_reflection_strength)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -503,15 +600,12 @@ class GaussianModel:
         new_rotation = self._rotation[selected_pts_mask]
         new_reflection_strength = self._reflection_strength[selected_pts_mask]
         
-        new_tmp_radii = self.tmp_radii[selected_pts_mask]
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_reflection_strength)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_reflection_strength, new_tmp_radii)
-
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-        self.tmp_radii = radii
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
 
@@ -521,8 +615,6 @@ class GaussianModel:
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
-        tmp_radii = self.tmp_radii
-        self.tmp_radii = None
 
         torch.cuda.empty_cache()
 

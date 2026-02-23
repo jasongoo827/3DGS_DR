@@ -14,6 +14,7 @@ import sys
 from datetime import datetime
 import numpy as np
 import random
+import open3d as o3d
 
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
@@ -131,3 +132,92 @@ def safe_state(silent):
     np.random.seed(0)
     torch.manual_seed(0)
     torch.cuda.set_device(torch.device("cuda:0"))
+
+# in: X,K
+# out: X,K+K*2*order
+def positional_encoding(pts, order):
+    if order == 0: return pts
+    exps = torch.exp2(torch.tensor(range(order)))
+    out_tensor = [pts]
+    for e in exps:
+        out_tensor.append(torch.sin(e*pts))
+        out_tensor.append(torch.cos(e*pts))
+    out_tensor = torch.cat(out_tensor, dim=-1)
+    return out_tensor
+
+def get_pencoding_len(dim, order):
+    return dim*(1+2*order)
+
+def write2ply_norgb(pts, save_path):
+  rgbs = np.ones_like(pts)
+  pcd = o3d.geometry.PointCloud()
+  pcd.points = o3d.utility.Vector3dVector(pts)
+  pcd.colors = o3d.utility.Vector3dVector(rgbs)
+  print('write ply file...')
+  o3d.io.write_point_cloud(save_path, pcd, write_ascii=True)
+  print('point cloud generate complete')
+
+# env_map: 16,7
+env_rayd1 = None
+def init_envrayd1(H,W):
+    i, j = np.meshgrid(
+        np.linspace(-np.pi, np.pi, W, dtype=np.float32),
+        np.linspace(0, np.pi, H, dtype=np.float32),
+        indexing='xy'
+    )
+    xy1 = np.stack([i, j], axis=2)
+    z = np.cos(xy1[..., 1])
+    x = np.sin(xy1[..., 1])*np.cos(xy1[...,0])
+    y = np.sin(xy1[..., 1])*np.sin(xy1[...,0])
+    global env_rayd1
+    env_rayd1 = torch.tensor(np.stack([x,y,z], axis=-1)).cuda()
+
+def get_env_rayd1(H,W):
+    if env_rayd1 is None:
+        init_envrayd1(H,W)
+    return env_rayd1
+
+env_rayd2 = None
+def init_envrayd2(H,W):
+    gy, gx = torch.meshgrid(torch.linspace( 0.0 + 1.0 / H, 1.0 - 1.0 / H, H, device='cuda'), 
+                            torch.linspace(-1.0 + 1.0 / W, 1.0 - 1.0 / W, W, device='cuda'),
+                            # indexing='ij')
+                            )
+    
+    sintheta, costheta = torch.sin(gy*np.pi), torch.cos(gy*np.pi)
+    sinphi, cosphi     = torch.sin(gx*np.pi), torch.cos(gx*np.pi)
+    
+    reflvec = torch.stack((
+        sintheta*sinphi, 
+        costheta, 
+        -sintheta*cosphi
+        ), dim=-1)
+    global env_rayd2
+    env_rayd2 = reflvec
+
+def get_env_rayd2(H,W):
+    if env_rayd2 is None:
+        init_envrayd2(H,W)
+    return env_rayd2
+
+pixel_camera = None
+def sample_camera_rays(HWK, R, T):
+    H,W,K = HWK
+    R = R.T # NOTE!!! the R rot matrix is transposed save in 3DGS
+    
+    global pixel_camera
+    if pixel_camera is None or pixel_camera.shape[0] != H:
+        K = K.astype(np.float32)
+        i, j = np.meshgrid(np.arange(W, dtype=np.float32),
+                        np.arange(H, dtype=np.float32),
+                        indexing='xy')
+        xy1 = np.stack([i, j, np.ones_like(i)], axis=2)
+        pixel_camera = np.dot(xy1, np.linalg.inv(K).T)
+        pixel_camera = torch.tensor(pixel_camera).cuda()
+
+    rays_o = (-R.T @ T.unsqueeze(-1)).flatten()
+    pixel_world = (pixel_camera - T[None, None]).reshape(-1, 3) @ R
+    rays_d = pixel_world - rays_o[None]
+    rays_d = rays_d / torch.norm(rays_d, dim=1, keepdim=True)
+    rays_d = rays_d.reshape(H,W,3)
+    return rays_d

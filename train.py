@@ -13,7 +13,7 @@ import os
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
-from gaussian_renderer import render, network_gui
+from gaussian_renderer import render, render_env_map
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
@@ -22,23 +22,24 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
 
-try:
-    from fused_ssim import fused_ssim
-    FUSED_SSIM_AVAILABLE = True
-except:
-    FUSED_SSIM_AVAILABLE = False
+# try:
+#     from fused_ssim import fused_ssim
+#     FUSED_SSIM_AVAILABLE = True
+# except:
+#     FUSED_SSIM_AVAILABLE = False
 
-try:
-    from diff_gaussian_rasterization import SparseGaussianAdam
-    SPARSE_ADAM_AVAILABLE = True
-except:
-    SPARSE_ADAM_AVAILABLE = False
+# try:
+#     from diff_gaussian_rasterization import SparseGaussianAdam
+#     SPARSE_ADAM_AVAILABLE = True
+# except:
+#     SPARSE_ADAM_AVAILABLE = False
 
 # 학습 코드
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
@@ -51,10 +52,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     FR_OPTIM_FROM_ITER = opt.feature_rest_from_iter
     NORMAL_PROP_UNTIL_ITER = opt.normal_prop_until_iter + opt.longer_prop_iter #24_000
     OPAC_LR0_INTERVAL = opt.opac_lr0_interval # 200
-    DENSIFIDATION_INTERVAL_WHEN_PROP = opt.densification_interval_when_prop #500
+    DENSIFICATION_INTERVAL_WHEN_PROP = opt.densification_interval_when_prop #500
     
     TOT_ITER = opt.iterations + opt.longer_prop_iter + 1
     DENSIFY_UNTIL_ITER = opt.densify_until_iter + opt.longer_prop_iter
+
+    # for real scenes
+    # 환경맵의 공간적 범위 설정
+    USE_ENV_SCOPE = opt.use_env_scope # False
+    if USE_ENV_SCOPE:
+        center = [float(c) for c in opt.env_scope_center]
+        ENV_CENTER = torch.tensor(center, device='cuda')
+        ENV_RADIUS = opt.env_scope_radius
+        REFL_MSK_LOSS_W = 0.4
 
     # Gaussian 초기화
     gaussians = GaussianModel(dataset.sh_degree)
@@ -86,32 +96,120 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     while iteration < TOT_ITER:
         iter_start.record()
 
-    # Every 1000 its we increase the levels of SH up to a maximum degree
-    if iteration > FR_OPTIM_FROM_ITER and iteration % 1000 == 0:
-        gaussians.oneupSHdegree()
-    if iteration > INIT_UNTIL_ITER:
-        initial_stage = False
-    
-    # Pick a random Camera -> Camera는 어떤 걸 쓰는지 공부 필요
-    if not viewpoint_stack:
-        viewpoint_stack = scene.getTrainCameras().copy()
-    viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        # Every 1000 its we increase the levels of SH up to a maximum degree
+        if iteration > FR_OPTIM_FROM_ITER and iteration % 1000 == 0:
+            gaussians.oneupSHdegree()
+        if iteration > INIT_UNTIL_ITER:
+            initial_stage = False
+        
+        # Pick a random Camera -> Camera는 어떤 걸 쓰는지 공부 필요
+        if not viewpoint_stack:
+            viewpoint_stack = scene.getTrainCameras().copy()
+        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
-    # Render
-    if (iteration - 1) == debug_from:
-        pipe.debug = True
-    render_pkg = render(viewpoint_cam, gaussians, pipe, background, initial_stage=initial_stage)
-    image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        # Render
+        if (iteration - 1) == debug_from:
+            pipe.debug = True
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background, initial_stage=initial_stage)
+        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
-    # GT
-    gt_image = viewpoint_cam.original_image.cuda()
-    # Loss
-    Ll1 = l1_loss(image, gt_image)
-    loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        # GT
+        gt_image = viewpoint_cam.original_image.cuda()
+        # Loss
+        Ll1 = l1_loss(image, gt_image)
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
 
-    loss.backward()
+        # Gaussian들이 설정된 공간적 범위 밖에 있는지 판별
+        def get_outside_msk():
+            return None if not USE_ENV_SCOPE else \
+                torch.sum((gaussians.get_xyz - ENV_CENTER[None])**2, dim=-1) > ENV_RADIUS**2
 
-    iter_end.record()
+        # 반사가 일어나면 안 되는 범위에서, 반사가 일어나지 않게 강제.
+        if USE_ENV_SCOPE and 'refl_strength_map' in render_pkg:
+            refls = gaussians.get_refl
+            refl_msk_loss = refls[get_outside_msk()].mean()
+            loss += REFL_MSK_LOSS_W * refl_msk_loss
+
+        loss.backward()
+
+        iter_end.record()
+
+        # Autograd 비활성화. requires_grad=True 인 변수에 대해 연산 중지.
+        with torch.no_grad():
+            # Progress bar
+            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            if iteration % 10 == 0:
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                progress_bar.update(10)
+            if iteration == TOT_ITER:
+                progress_bar.close()
+            
+            # Log and save
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            if (iteration in saving_iterations or iteration == TOT_ITER-1):
+                print("\n[ITER {}] Saving Gaussians".format(iteration))
+                scene.save(iteration)
+
+            # Densification
+            if iteration < DENSIFY_UNTIL_ITER:
+                # Keep track of max radii in image-space for pruning
+                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                # densification을 위한 gradient update
+                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+
+                if iteration <= INIT_UNTIL_ITER:
+                    opacity_reset_intval = 3000 # Opacity 낮추는 주기
+                    densification_interval = 100 # gaussian densification 주기
+                elif iteration <= NORMAL_PROP_UNTIL_ITER:
+                    opacity_reset_intval = 3000 # 2:1 (reset 1: reset 0)
+                    densification_interval = DENSIFICATION_INTERVAL_WHEN_PROP
+                else:
+                    opacity_reset_intval = 3000
+                    densification_interval = 100
+
+                # 3dgs에서 하던 densification
+                # gradient > threshold일 때, scale 작으면 clone
+                # scale 크면 split
+                # opacity < threshold || 너무 large scale || ! visiblilty filter 이면 prune
+                if iteration > opt.densify_from_iter and iteration % densification_interval == 0:
+                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    gaussians.densify_and_prune(
+                        opt.densify_grad_threshold, 
+                        opt.prune_opacity_threshold, 
+                        scene.cameras_extent, size_threshold, 
+                    )
+                
+                HAS_RESET0 = False
+                # 3dgs의 원래 opacity reset 주기
+                if iteration % opacity_reset_intval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                    HAS_RESET0 = True
+                    outside_msk = get_outside_msk()
+                    gaussians.reset_opacity0()
+                    gaussians.reset_refl(exclusive_msk=outside_msk) ###
+                if  OPAC_LR0_INTERVAL > 0 and (INIT_UNTIL_ITER < iteration <= NORMAL_PROP_UNTIL_ITER) and iteration % OPAC_LR0_INTERVAL == 0: ## 200->50
+                    gaussians.set_opacity_lr(opt.opacity_lr)
+                # 3dgs DEFERRED REFLECTION에 추가된 주기
+                if  (INIT_UNTIL_ITER < iteration <= NORMAL_PROP_UNTIL_ITER) and iteration % 1000 == 0:
+                    if not HAS_RESET0:
+                        outside_msk = get_outside_msk()
+                        # gaussian의 opacity 0.9 이상으로 키우기
+                        gaussians.reset_opacity1(exclusive_msk=outside_msk)
+                        # Color Sabotage
+                        gaussians.dist_color(exclusive_msk=outside_msk) #
+                        # 반사 강도가 높은 gaussian의 scale 키우기
+                        gaussians.reset_scale(exclusive_msk=outside_msk)
+                        if OPAC_LR0_INTERVAL > 0 and iteration != NORMAL_PROP_UNTIL_ITER:
+                            gaussians.set_opacity_lr(0.0)
+                            
+            # Optimizer step
+            if iteration < TOT_ITER:
+                gaussians.optimizer.step()
+                gaussians.optimizer.zero_grad(set_to_none = True)
+
+            if (iteration in checkpoint_iterations):
+                print("\n[ITER {}] Saving Checkpoint".format(iteration))
+                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+        iteration += 1
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -135,32 +233,41 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
+        tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
 
     # Report test and samples of training set
-    if iteration in testing_iterations:
+    if iteration % 10_000 == 0:
         torch.cuda.empty_cache()
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
+        env_res = render_env_map(scene.gaussians)
+        for env_name in env_res.keys():
+            if tb_writer:
+                tb_writer.add_image("#envmap/{}".format(env_name), env_res[env_name], global_step=iteration)
+        
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
+                    res = renderFunc(viewpoint, scene.gaussians, more_debug_infos = True, *renderArgs)
+                    image = torch.clamp(res["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    if train_test_exp:
-                        image = image[..., image.shape[-1] // 2:]
-                        gt_image = gt_image[..., gt_image.shape[-1] // 2:]
                     if tb_writer and (idx < 5):
-                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                        if iteration == testing_iterations[0]:
-                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                        for maps_name in res.keys():
+                            if 'map' in maps_name:
+                                if 'normal' in maps_name:
+                                     res[maps_name] = res[maps_name]*0.5+0.5
+                                tb_writer.add_image(config['name'] + "_view_{}/{}".format(viewpoint.image_name, maps_name), res[maps_name], global_step=iteration)    
+                        tb_writer.add_image(config['name'] + "_view_{}/2_render".format(viewpoint.image_name), image, global_step=iteration)
+                        if iteration == 10_000:
+                            tb_writer.add_image(config['name'] + "_view_{}/1_ground_truth".format(viewpoint.image_name), gt_image, global_step=iteration)
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                 psnr_test /= len(config['cameras'])
@@ -172,7 +279,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
-            tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
+            #tb_writer.add_scalar("refl_gauss_ratio", scene.gaussians.get_refl_strength_to_total.item(), iteration)
+            
         torch.cuda.empty_cache()
 
 
