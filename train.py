@@ -126,7 +126,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # 반사가 일어나면 안 되는 범위에서, 반사가 일어나지 않게 강제.
         if USE_ENV_SCOPE and 'refl_strength_map' in render_pkg:
-            refls = gaussians.get_refl
+            refls = gaussians.get_reflection_strength
             refl_msk_loss = refls[get_outside_msk()].mean()
             loss += REFL_MSK_LOSS_W * refl_msk_loss
 
@@ -200,7 +200,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         gaussians.reset_scale(exclusive_msk=outside_msk)
                         if OPAC_LR0_INTERVAL > 0 and iteration != NORMAL_PROP_UNTIL_ITER:
                             gaussians.set_opacity_lr(0.0)
-                            
+
             # Optimizer step
             if iteration < TOT_ITER:
                 gaussians.optimizer.step()
@@ -310,8 +310,8 @@ if __name__ == "__main__":
     safe_state(args.quiet)
 
     # Start GUI server, configure and run training
-    if not args.disable_viewer:
-        network_gui.init(args.ip, args.port)
+    # if not args.disable_viewer:
+    #     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 

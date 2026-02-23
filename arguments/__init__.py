@@ -29,11 +29,15 @@ class ParamGroup:
             if shorthand:
                 if t == bool:
                     group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
+                elif t == list:
+                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, nargs="+")
                 else:
                     group.add_argument("--" + key, ("-" + key[0:1]), default=value, type=t)
             else:
                 if t == bool:
                     group.add_argument("--" + key, default=value, action="store_true")
+                elif t == list:
+                    group.add_argument("--" + key, default=value, nargs="+")
                 else:
                     group.add_argument("--" + key, default=value, type=t)
 
@@ -50,10 +54,8 @@ class ModelParams(ParamGroup):
         self._source_path = ""
         self._model_path = ""
         self._images = "images"
-        self._depths = ""
         self._resolution = -1
         self._white_background = False
-        self.train_test_exp = False
         self.data_device = "cuda"
         self.eval = False
         super().__init__(parser, "Loading Parameters", sentinel)
@@ -68,7 +70,6 @@ class PipelineParams(ParamGroup):
         self.convert_SHs_python = False
         self.compute_cov3D_python = False
         self.debug = False
-        self.antialiasing = False
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
@@ -78,27 +79,34 @@ class OptimizationParams(ParamGroup):
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
         self.position_lr_max_steps = 30_000
+        self.reflection_lr = 0.006
         self.feature_lr = 0.0025
-        self.opacity_lr = 0.025
+        self.opacity_lr = 0.05
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
-        self.exposure_lr_init = 0.01
-        self.exposure_lr_final = 0.001
-        self.exposure_lr_delay_steps = 0
-        self.exposure_lr_delay_mult = 0.0
+        self.envmap_cubemap_lr = 0.05#0.05
         self.percent_dense = 0.01
+        self.refl_init_value = 1e-3
         self.lambda_dssim = 0.2
+        self.lambda_refl_smooth = 0.4
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500
-        self.densify_until_iter = 15_000
+        self.densify_until_iter = 30_000 #36_000 #15_000
+        #self.densify_grad_threshold = 0.0002
         self.densify_grad_threshold = 0.0002
-        self.depth_l1_weight_init = 1.0
-        self.depth_l1_weight_final = 0.01
-        self.random_background = False
-        self.optimizer_type = "default"
-        self.reflection_lr = 0.006
-        self.cubemap_lr = 0.01
+        self.prune_opacity_threshold = 0.005
+
+        self.init_until_iter = 3000 #3000
+        self.feature_rest_from_iter = 10_000
+        self.normal_prop_until_iter = 24_000 #24_000
+        self.opac_lr0_interval = 200
+        self.densification_interval_when_prop = 500
+        self.longer_prop_iter = 0
+
+        self.use_env_scope = False
+        self.env_scope_center = [0.,0.,0.]
+        self.env_scope_radius = 0.0
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

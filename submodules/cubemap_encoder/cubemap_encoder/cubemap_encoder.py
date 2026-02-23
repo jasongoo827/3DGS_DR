@@ -6,12 +6,13 @@ import torch.nn as nn
 from torch.cuda.amp import custom_fwd, custom_bwd
 
 # why try-catch? ImportError 정말 일어남?
-from _cubemapencoder import _backend
+import _cubemapencoder as _backend
 
 class _cubemap_encode(torch.autograd.Function):
     @staticmethod
     @custom_fwd(cast_inputs=torch.float32)
-    def forward(inputs, embeddings, fail_value):
+    def forward(ctx, inputs, embeddings, fail_value):
+        ctx.save_for_backward(inputs, embeddings)
         embeddings = embeddings.contiguous()
         inputs = inputs.contiguous()
 
@@ -28,15 +29,6 @@ class _cubemap_encode(torch.autograd.Function):
         _backend.cubemap_encode_forward(inputs, embeddings, fail_value, outputs,
                                         B, C, L)
         return outputs
-
-    # PyTorch 2.x 방식
-    @staticmethod
-    def setup_context(ctx, inputs, output):
-
-        # 컨텍스트 설정 (forward의 입력/출력을 받아 필요한 것만 저장)
-        # inputs: (inputs, embeddings, fail_value)
-        inp, embeddings, fail_value = inputs
-        ctx.save_for_backward(inp, embeddings)
 
     @staticmethod
     @custom_bwd
@@ -63,7 +55,7 @@ cubemap_encode = _cubemap_encode.apply
 
 class CubemapEncoder(nn.Module):
     def __init__(self, output_dim, resolution=256):
-        super().__init()
+        super().__init__()
 
         self.input_dim = 3
         self.resolution = resolution

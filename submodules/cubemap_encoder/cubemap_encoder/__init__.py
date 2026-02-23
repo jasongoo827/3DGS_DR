@@ -1,1 +1,1 @@
-from cubemap_encoder import CubemapEncoder
+from .cubemap_encoder import CubemapEncoder
