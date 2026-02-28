@@ -94,7 +94,6 @@ class _RasterizeGaussians(torch.autograd.Function):
                 raise ex
         else:
             num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians(*args)
-
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
@@ -136,14 +135,13 @@ class _RasterizeGaussians(torch.autograd.Function):
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:
                 grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_bgmap, grad_sh, grad_scales, grad_rotations = _C.rasterize_gaussians_backward(*args)
-                
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_bw.dump")
                 print("\nAn error occured in backward. Writing snapshot_bw.dump for debugging.\n")
                 raise ex
-        else:            
-             grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_bgmap, grad_sh, grad_scales, grad_rotations = _C.rasterize_gaussians_backward(*args)             
-        
+        else:
+             grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_bgmap, grad_sh, grad_scales, grad_rotations = _C.rasterize_gaussians_backward(*args)
+            
         #print(grad_bgmap)
         #print(grad_sh.shape)
         if grad_sh.shape[0] == 0 and grad_sh.shape[1] == 0:
@@ -196,9 +194,6 @@ class GaussianRasterizer(nn.Module):
         
         raster_settings = self.raster_settings
 
-        # if (shs is None and colors_precomp is None) or (shs is not None and colors_precomp is not None):
-        #     raise Exception('Please provide excatly one of either SHs or precomputed colors!')
-        
         if ((scales is None or rotations is None) and cov3D_precomp is None) or ((scales is not None or rotations is not None) and cov3D_precomp is not None):
             raise Exception('Please provide exactly one of either scale/rotation pair or precomputed 3D covariance!')
         

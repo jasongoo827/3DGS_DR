@@ -17,7 +17,7 @@ namespace cg = cooperative_groups;
 
 // Backward pass for conversion of spherical harmonics to RGB for
 // each Gaussian.
-__device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, const bool* clamped, const glm::vec3* dL_dcolor, glm::vec3* dL_dmeans, glm::vec3* dL_dshs)
+__device__ void computeColorFromSH(int idx, int deg, int max_coeffs, int C, const glm::vec3* means, glm::vec3 campos, const float* shs, const bool* clamped, const float* dL_dcolor, glm::vec3* dL_dmeans, glm::vec3* dL_dshs)
 {
 	// Compute intermediate values, as it is done during forward
 	glm::vec3 pos = means[idx];
@@ -28,7 +28,11 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 
 	// Use PyTorch rule for clamping: if clamping was applied,
 	// gradient becomes 0.
-	glm::vec3 dL_dRGB = dL_dcolor[idx];
+	glm::vec3 dL_dRGB;
+	dL_dRGB.x = dL_dcolor[idx*C];
+	dL_dRGB.y = dL_dcolor[idx*C+1];
+	dL_dRGB.z = dL_dcolor[idx*C+2];
+	
 	dL_dRGB.x *= clamped[3 * idx + 0] ? 0 : 1;
 	dL_dRGB.y *= clamped[3 * idx + 1] ? 0 : 1;
 	dL_dRGB.z *= clamped[3 * idx + 2] ? 0 : 1;
@@ -388,7 +392,7 @@ __global__ void preprocessCUDA(
 
 	// Compute gradient updates due to computing colors from SHs
 	if (shs)
-		computeColorFromSH(idx, D, M, (glm::vec3*)means, *campos, shs, clamped, (glm::vec3*)dL_dcolor, (glm::vec3*)dL_dmeans, (glm::vec3*)dL_dsh);
+		computeColorFromSH(idx, D, M, C, (glm::vec3*)means, *campos, shs, clamped, dL_dcolor, (glm::vec3*)dL_dmeans, (glm::vec3*)dL_dsh);
 
 	// Compute gradient updates due to computing covariance from scale/rotation
 	if (scales)
@@ -410,6 +414,7 @@ renderCUDA(
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
 	float3* __restrict__ dL_dmean2D,
+	float3* __restrict__ dL_dmean2D_,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors,
@@ -513,6 +518,8 @@ renderCUDA(
 			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
 			// pair).
 			float dL_dalpha = 0.0f;
+			float dL_dalpha_m2d = 0.0f;
+
 			const int global_id = collected_id[j];
 			for (int ch = 0; ch < C; ch++)
 			{
@@ -523,13 +530,20 @@ renderCUDA(
 				last_color[ch] = c;
 
 				const float dL_dchannel = dL_dpixel[ch];
-				dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
+				const float acc_dl_dalpha = (c - accum_rec[ch]) * dL_dchannel;
+				dL_dalpha += acc_dl_dalpha;
+				// for accumlated gradient to justify densification,
+				// only the first 3 channel are colors
+				// normal and refl do not contrbute the gradient
+				if(ch < 3)
+					dL_dalpha_m2d += acc_dl_dalpha;
 				// Update the gradients w.r.t. color of the Gaussian. 
 				// Atomic, since this pixel is just one of potentially
 				// many that were affected by this Gaussian.
 				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
 			}
 			dL_dalpha *= T;
+			dL_dalpha_m2d *= T;
 			// Update last alpha (to be used in the next iteration)
 			last_alpha = alpha;
 
@@ -539,6 +553,7 @@ renderCUDA(
 			for (int i = 0; i < C; i++)
 				bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
 			dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
+			dL_dalpha_m2d += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
 			
 			/*
 			///////////////////////////////////////////////
@@ -565,6 +580,7 @@ renderCUDA(
 
 			// Helpful reusable temporary variables
 			const float dL_dG = con_o.w * dL_dalpha;
+			const float dL_dG_m2d = con_o.w * dL_dalpha_m2d;
 			const float gdx = G * d.x;
 			const float gdy = G * d.y;
 			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
@@ -574,6 +590,8 @@ renderCUDA(
 			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
 			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
 
+			atomicAdd(&dL_dmean2D_[global_id].x, dL_dG_m2d * dG_ddelx * ddelx_dx);
+			atomicAdd(&dL_dmean2D_[global_id].y, dL_dG_m2d * dG_ddely * ddely_dy);
 			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
 			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
 			atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
@@ -663,6 +681,7 @@ void BACKWARD::render(
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
 	float3* dL_dmean2D,
+	float3* dL_dmean2D_,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
 	float* dL_dcolors,
@@ -680,6 +699,7 @@ void BACKWARD::render(
 		n_contrib,
 		dL_dpixels,
 		dL_dmean2D,
+		dL_dmean2D_,
 		dL_dconic2D,
 		dL_dopacity,
 		dL_dcolors,
